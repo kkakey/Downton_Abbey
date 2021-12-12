@@ -1,0 +1,244 @@
+---
+title: "downton_abbey_webscraping"
+author: "Kristen A, kkakey"
+date: "12/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(rvest)
+```
+
+Transcripts of Downton Abbey come from ["Forever Dreaming"](https://transcripts.foreverdreaming.org/viewforum.php?f=151)
+
+```{r}
+main_page <- read_html("http://transcripts.foreverdreaming.org/viewforum.php?f=151")
+links_all <- main_page %>% 
+  html_nodes(".tablebg") %>%
+  html_nodes("a") %>%
+  html_attr("href") 
+links1 <- substr(links_all, 2, 28)
+# remove first two links
+links1 <- links1[3:length(links1)]
+
+# scrape up to Season 3 Episode 4 -- after that the formating changes, and the speaker and scene are not identified :(
+links1 <- links1[!(links1 %in% (grep(pattern="34\\d{2}", links1,value=T)))][1:19]
+```
+
+```{r}
+full_df = data.frame()
+for (web_page in links1) {
+    # print(web_page)
+    page <- read_html(paste0("http://transcripts.foreverdreaming.org",
+                             as.character(web_page)))
+    
+    scrape <- page %>%
+      html_nodes ("body > div ~ div") %>% 
+      html_text() %>%
+      str_remove_all("\t") %>%
+      str_split( "\n") %>%
+      .[[1]]
+    # remove non-script text
+    scrape <- scrape[47:length(scrape)]
+    
+    # Add scene changes
+    scrape[scrape==""] <- "SCENE CHANGE"
+    
+    # remove directions (lines with '[scence description]')
+    scrape <- scrape[-(grep(pattern="[][]",scrape))]
+    
+    scrape <- as.data.frame(scrape) %>%
+      separate(col="scrape", into = c("Speaker","Text"), 
+               sep=":", fill = "right") %>%
+      mutate(Speaker = str_replace(Speaker, " \\s*\\([^\\)]+\\)", ""))
+    
+    # remove end non-script text
+    count <- 0
+    for (i in seq_along(scrape$Speaker)) {
+      if (scrape$Speaker[i]=="SCENE CHANGE") {
+        count <- count+1
+      }
+      else {
+        count <- count-1
+        count <- max(0, count)
+      }
+      if (count==3) {
+        index_to_remove <- i-2
+      }
+    }
+    scrape <- scrape[c(1:index_to_remove-1),]
+    
+    
+    scrape <- scrape %>%
+      filter(!Speaker %in% "April 1912")
+    # if SCENE CHANGE is first line --> remove
+    if (scrape$Speaker[1]=="SCENE CHANGE") {
+       scrape <- scrape[-1,]
+       row.names(scrape) <- NULL
+    }
+    
+    # areas where text field in Speaker field -- fix!
+    fix_speaker <- NULL
+    fixed_speaker <- NULL
+    fix_speaker <- scrape %>%
+      rownames_to_column('rn') %>%
+      filter(is.na(Text) & Speaker!="SCENE CHANGE")
+    
+    # should be Speaker, text, Speaker, text, etc. in fix_speaker$Speaker
+    # if multiple lines of text (with Speaker not associated), readd Speaker
+
+    # check if there are directly seqential values --> these need a Speaker added to them
+    ind_val <- 0
+    ind_to_fix <- c()
+    for (num in grep("[:upper:]",fix_speaker$Speaker)) {
+      if (num - 1 == ind_val) {
+         ind_to_fix <- c(ind_to_fix, num)
+      }
+      if (num + 1 == ind_val) {
+        ind_to_fix <- c(ind_to_fix, num)
+      }
+      ind_val <- num
+    }
+    
+    ind_to_add <- sapply(fix_speaker[ind_to_fix,]$rn, function(x) as.numeric(x) -1)
+    
+    if (is.null(ind_to_fix)) {
+      tryCatch({
+        fixed_speaker <- fix_speaker %>%
+          filter(str_detect(Speaker, '[:upper:]') & 
+                   !str_detect(Speaker, '[:lower:]')) %>%
+          select(rn, Speaker) %>%
+          cbind(., fix_speaker %>%
+                  filter(str_detect(Speaker, '[:lower:]')) %>%
+                  select(Speaker) %>% rename(Text = Speaker))
+      }, error = function(e){
+          # if row numbers don't match
+          fixed_speaker <- fix_speaker %>%
+            filter(str_detect(Speaker, '[:upper:]') & 
+                     !str_detect(Speaker, '[:lower:]')) %>%
+            select(rn, Speaker) %>%
+            cbind(., fix_speaker %>%
+                    filter(str_detect(Speaker, '[:lower:]'),
+                           !row_number() %in% 1) %>%
+                    select(Speaker) %>% rename(Text = Speaker))
+        
+      })
+    } else if (!is.null(ind_to_fix) & scrape[ind_to_add,]$Speaker=="SCENE CHANGE"){
+        tryCatch({
+          fixed_speaker <- fix_speaker %>%
+            filter(str_detect(Speaker, '[:upper:]') & 
+                     !str_detect(Speaker, '[:lower:]')) %>%
+            select(rn, Speaker) %>%
+            cbind(., fix_speaker %>%
+                    filter(str_detect(Speaker, '[:lower:]')) %>%
+                    select(Speaker) %>% rename(Text = Speaker))
+        }, error = function(e){
+            # if row numbers don't match
+            fixed_speaker <- fix_speaker %>%
+              filter(str_detect(Speaker, '[:upper:]') & 
+                       !str_detect(Speaker, '[:lower:]')) %>%
+              select(rn, Speaker) %>%
+              cbind(., fix_speaker %>%
+                      filter(str_detect(Speaker, '[:lower:]'),
+                             !row_number() %in% 1) %>%
+                      select(Speaker) %>% rename(Text = Speaker))
+          
+        })
+
+    } else {
+        fix_speaker <- scrape[ind_to_add,] %>%
+          rownames_to_column('rn') %>%
+          rbind(fix_speaker) %>%
+          arrange(as.numeric(rn)) %>%
+          distinct() 
+        
+        should_be_text_ind <- grep('[^ ]+ +[^ .?!]+[!?.]', fix_speaker$Speaker)
+        should_be_speaker_ind <-sapply(should_be_text_ind, function(x) as.numeric(x) -1)
+        
+        fixed_speaker <- fix_speaker[should_be_speaker_ind,] %>%
+          select(rn, Speaker) %>%
+          cbind(., fix_speaker[should_be_text_ind,] %>%
+                  select(Speaker) %>% rename(Text = Speaker))
+      
+    } 
+    
+    scrape[fixed_speaker$rn,] <- fixed_speaker[,c("Speaker", "Text")]
+    
+    scrape <- scrape %>%
+      mutate(Text = ifelse(Speaker=="SCENE CHANGE", 
+                           "SCENE CHANGE", Text)) %>%
+      filter(!is.na(Text))
+
+    # Add scene number
+    the_df = data.frame(matrix(ncol = 3, nrow = 0))
+    c <- 0
+    for (df in split(scrape, cumsum(scrape$Speaker == "SCENE CHANGE"))) {
+      c<- c + 1
+      df$Scene <- c
+      the_df <- rbind(the_df,df)
+    }
+    # make names all lowercase to remove duplicate 
+    # names with different capitalization
+    # i.e Mr Carsen and MR CARSEN are the same person
+    the_df$Speaker <- tolower(the_df$Speaker)
+    the_df <- the_df %>% filter(!(Speaker %in% c("scene change", "end credits")))
+    
+    # get season/episode number
+    epi<- page %>%
+      html_nodes (".boxheading") %>% 
+      .[2] %>%
+      html_text() %>%
+      str_remove_all("\t") %>%
+      str_split( "\n") %>%
+      .[[1]] %>%
+      stringi::stri_remove_empty(.)
+    the_df$Episode <- epi
+    # add ordering to lines
+    the_df$line_order_in_episode <- seq(1:nrow(the_df))
+    
+    full_df <- rbind(full_df,the_df)
+}
+
+```
+
+```{r}
+# standardize names
+full_df[full_df$Speaker=="violet, countess of grantham",]$Speaker <- "violet, dowager countess of grantham"
+full_df[full_df$Speaker=="violet",]$Speaker <- "violet, dowager countess of grantham"
+full_df[full_df$Speaker=="o'brien",]$Speaker <- "miss o'brien"
+full_df[full_df$Speaker=="mrs bates",]$Speaker <- "vera bates"
+full_df[full_df$Speaker=="mr drake",]$Speaker <- "john drake"
+full_df[full_df$Speaker=="jane",]$Speaker <- "jane moorsum"
+full_df[full_df$Speaker=="daisy",]$Speaker <- "daisy mason"
+full_df[full_df$Speaker=="isobel crawley(to the butler)",]$Speaker <- "isobel crawley"
+full_df[full_df$Speaker=="alfred",]$Speaker <- "alfred nugent"
+full_df[full_df$Speaker=="anna",]$Speaker <- "anna bates"
+full_df[full_df$Speaker=="cora, countess of grantham(at a normal volume, but with the tone of shouting)",]$Speaker <- "cora, countess of grantham"
+full_df[full_df$Speaker=="cora",]$Speaker <- "cora, countess of grantham"
+full_df[full_df$Speaker=="isobel",]$Speaker <- "isobel crawley"
+full_df[full_df$Speaker=="mary",]$Speaker <- "lady mary"
+full_df[full_df$Speaker=="lady mary crawley",]$Speaker <- "lady mary"
+full_df[full_df$Speaker=="edith",]$Speaker <- "lady edith"
+full_df[full_df$Speaker=="lady edith crawley",]$Speaker <- "lady edith"
+full_df[full_df$Speaker=="sybil",]$Speaker <- "lady sybil"
+full_df[full_df$Speaker=="matthew crawley",]$Speaker <- "matthew"
+full_df[full_df$Speaker=="robert",]$Speaker <- "robert, earl of grantham"
+full_df[full_df$Speaker=="sybil branson",]$Speaker <- "lady sybil"
+full_df[full_df$Speaker=="sarah o'brien",]$Speaker <- "miss o'brien"
+full_df[full_df$Speaker=="miss sarah o-brien",]$Speaker <- "miss o'brien"
+full_df[full_df$Speaker=="branson",]$Speaker <- "tom"
+full_df[full_df$Speaker=="bates",]$Speaker <- "mr bates"
+```
+
+
+```{r}
+# save output
+write.csv(full_df, "./DowntonAbbey-seasons_1-3.4_scripts.csv")
+```
+
+
